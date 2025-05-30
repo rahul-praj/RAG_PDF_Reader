@@ -1,16 +1,22 @@
 from typing import List, Union
+import numpy as np
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from langchain.chat_models import ChatOpenAI
 import uuid
 from dotenv import load_dotenv
 import os
+from sklearn.pipeline import Pipeline
+import hdbscan
+from sentence_transformers import SentenceTransformer
+from umap import UMAP
+import matplotlib.pyplot as plt
 
 # Load environment variables from .env file
 load_dotenv()
 
 class AgenticChunker:
-    def __init__(self, openai_api_key: Union[str, None] = None):
+    def __init__(self, openai_api_key: Union[str, None] = None, model_name: str = "all-mpnet-base-v2"):
         """Initialize the AgenticChunker with an OpenAI API key.
         Args:
             openai_api_key: Optional; if not provided, it will look for the OPENAI_API_KEY environment variable.
@@ -26,6 +32,8 @@ class AgenticChunker:
 
         self.llm = ChatOpenAI(model='gpt-4-1106-preview', openai_api_key=openai_api_key, temperature=0)
         # Need to set up the OpenAI API client here if you want to use it for generating summaries.
+
+        self.model = SentenceTransformer(model_name)
 
     # Need a function that loops through each chunk and adds the following metadata:
     # - chunk_id: A unique identifier for the chunk, e.g., "source_0", "source_1", etc.
@@ -62,63 +70,11 @@ class AgenticChunker:
                     )
                 )
         return chunked_docs
-
-    # Need a function that creates the title of the chunk passed into it, using the OpenAI API.
-    def generate_title(self, chunk: str) -> str:
-        """
-        Generate a title for a given chunk of text.
-        This is a placeholder function that should be replaced with an actual API call to OpenAI or similar service.
-        
-        Args:
-            chunk: The text chunk to title.
-
-        Returns:
-            A title for the chunk.
-        """
-
-        PROMPT = ChatPromptTemplate.from_messages([
-            ("system",
-             """
-            You are a helpful assistant that oversees chunks of text from a specific document.
-            Your task is to assess the content of each chunk and generate a concise title that captures the essence of the text.
-            The title should be informative, engaging, and relevant to the content of the chunk.
-            If you feel that various chunks are related, you can create a title that encompasses the main theme or topic of those chunks.
-
-            Example:
-            Chunk: "The financial report for Arsenal FC shows a significant increase in revenue, driven by successful merchandise sales and matchday income."
-            Title: "Arsenal FC's Financial Growth: Revenue Surge from Merchandise and Matchday Income"
-
-            A similar example chunk might be:
-            Chunk: "Arsenal FC's financial performance has been impressive this year, with a notable rise in income from merchandise and matchday activities."
-            Title: "Arsenal FC's Financial Performance: Rise in Merchandise and Matchday Income"
-            Here the chunks are similar, so a common title has been created for both chunks.
-
-            A different example chunk might be:
-            Chunk: "The new stadium development plans for Arsenal FC have been approved, promising to enhance the matchday experience for fans."
-            Title: "Arsenal FC's New Stadium Development Plans Approved"
-            Here the chunk is not directly related to the previous example chunks, so a new title has been created for this chunk.
-
-            Only respond with the chunk title, nothing else.
-             """
-             ),
-            ("user", "Chunk's propositions:\n{proposition}\n\nChunk summary:\n{current_summary}\n\nCurrent chunk title:\n{current_title}")
-        ])
-
-        chain = PROMPT | self.llm
-
-        response = chain.invoke({
-            "proposition": chunk,
-            "current_summary": self.generate_summary(chunk),
-            "current_title": "Untitled"
-        })
-        # Placeholder for actual API call
-        return f"Title for chunk: {chunk[:30]}..."
     
     # Need a function that generates a summary of the chunk passed into it, using the OpenAI API.
     def generate_summary(self, chunk: str) -> str:
         """
         Generate a summary for a given chunk of text.
-        This is a placeholder function that should be replaced with an actual API call to OpenAI or similar service.
         
         Args:
             chunk: The text chunk to summarize.
@@ -153,9 +109,28 @@ class AgenticChunker:
         summary = chain.invoke({
             "proposition": chunk,
             "current_summary": ""
-        })
+        }).content
 
         return summary
+    
+    # Need a function that generates embeddings for each chunk summary, which will be used for clustering.
+    def generate_embeddings(self, chunks: List[Document]) -> np.ndarray:
+        """
+        Generate embeddings for the summaries of the provided chunks using a pre-trained model.
+        Args:
+            chunks: A list of Document objects, each containing a summary in its metadata.
+        Returns:
+            A numpy array of embeddings for the summaries.
+        """
+        if not chunks:
+            return np.empty((0, 0))
+
+        summaries = [chunk.metadata.get("summary", "") for chunk in chunks]
+
+        # Generate embeddings for the summaries
+        embeddings = self.model.encode(summaries, convert_to_tensor=False)
+
+        return np.array(embeddings)
     
     # Need a function that creates a clustering algorithm that uses the embeddings of the chunk summaries to group similar chunks together.
     def cluster_chunks(self, chunks: List[Document]) -> List[List[Document]]:
@@ -168,6 +143,77 @@ class AgenticChunker:
         Returns:
             A list of clusters, where each cluster is a list of Document objects.
         """
-        
-        # This could involve generating embeddings for the summaries and then applying a clustering algorithm like KMeans or DBSCAN.
-        return [chunks]  # For now, return all chunks in a single cluster
+        embeddings = self.generate_embeddings(chunks)
+
+        if embeddings.shape[0] == 0:
+            return []
+
+        clustering_model = hdbscan.HDBSCAN(min_cluster_size=2, metric='euclidean')
+        labels = clustering_model.fit_predict(embeddings)
+
+        clusters = {}
+
+        for label, chunk in zip(labels, chunks):
+            # Optionally skip noise points (label = -1)
+            if label == -1:
+                continue
+            clusters.setdefault(label, []).append(chunk)
+
+        return list(clusters.values())
+    
+    # Need a function that projects the clustered chunks into a visualization space using UMAP
+    def visualize_clusters_with_umap(embeddings: np.ndarray, labels: List[int], chunks: List[Document]):
+        """
+        Visualize clustered embeddings in 2D space using UMAP.
+
+        Args:
+            embeddings: A 2D NumPy array of shape (n_chunks, embedding_dim)
+            labels: A list of cluster labels (one per chunk)
+            chunks: The original Document chunks (used for optional annotations)
+        """
+        if embeddings.shape[0] == 0:
+            print("No embeddings to visualize.")
+            return
+
+        # Reduce to 2D with UMAP
+        reducer = UMAP(n_components=2, random_state=42)
+        embedding_2d = reducer.fit_transform(embeddings)
+
+        # Handle colors: assign a color per cluster label (noise = -1)
+        unique_labels = sorted(set(labels))
+        palette = plt.cm.get_cmap('tab10', len(unique_labels))
+        colors = [palette(unique_labels.index(label)) for label in labels]
+
+        # Plot
+        plt.figure(figsize=(10, 6))
+        scatter = plt.scatter(
+            embedding_2d[:, 0], embedding_2d[:, 1],
+            c=colors, s=60, alpha=0.8, edgecolors='k'
+        )
+
+        plt.title("UMAP Projection of Clustered Chunks")
+        plt.xlabel("UMAP 1")
+        plt.ylabel("UMAP 2")
+        plt.grid(True)
+
+        # Optional: annotate noise
+        if -1 in labels:
+            noise_indices = [i for i, l in enumerate(labels) if l == -1]
+            plt.scatter(
+                embedding_2d[noise_indices, 0],
+                embedding_2d[noise_indices, 1],
+                c='lightgray', label='Noise', s=60, edgecolors='k'
+            )
+
+        # Optional legend
+        handles = [plt.Line2D([0], [0], marker='o', color='w', label=f'Cluster {label}',
+                            markerfacecolor=palette(unique_labels.index(label)), markersize=8)
+                for label in unique_labels if label != -1]
+        if -1 in unique_labels:
+            handles.append(plt.Line2D([0], [0], marker='o', color='w', label='Noise',
+                                    markerfacecolor='lightgray', markersize=8))
+        plt.legend(handles=handles, loc='best')
+
+        plt.tight_layout()
+        plt.show()
+
