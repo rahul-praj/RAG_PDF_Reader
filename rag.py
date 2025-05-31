@@ -59,19 +59,19 @@ chunks = chunk_documents(doc, chunk_overlap=0)
 print(len(chunks))  # Display the number of chunks created
 print(chunks[455].page_content)  # Display the content of the first chunk
 
-# def create_vector_store(chunks: list[Document], collection_name: str = "arsenal_financial_report") -> chromadb.Client:
-#     """Create a vector store from the document chunks."""
-#     embeddings = OllamaEmbeddings(model="llama2")
-#     client = chromadb.Client()
-#     collection = client.create_collection(name=collection_name)
+def create_vector_store(chunks: list[Document], collection_name: str = "arsenal_financial_report") -> chromadb.Client:
+    """Create a vector store from the document chunks."""
+    embeddings = OllamaEmbeddings(model="llama2")
+    client = chromadb.Client()
+    collection = client.create_collection(name=collection_name)
 
-#     for chunk in chunks:
-#         collection.add(
-#             documents=[chunk.page_content],
-#             metadatas=[chunk.metadata],
-#             ids=[str(chunk.metadata.get("chunk_index", "unknown"))],
-#             embeddings=[embeddings.embed_documents([chunk.page_content])[0]]
-#         )
+    for chunk in chunks:
+        collection.add(
+            documents=[chunk.page_content],
+            metadatas=[chunk.metadata],
+            ids=[str(chunk.metadata.get("chunk_index", "unknown"))],
+            embeddings=[embeddings.embed_documents([chunk.page_content])[0]]
+        )
 
-#     return client
+    return client
 

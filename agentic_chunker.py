@@ -1,5 +1,6 @@
 from typing import List, Union
 import numpy as np
+from langchain_text_splitters import SentenceTransformersTokenTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from langchain.chat_models import ChatOpenAI
@@ -42,7 +43,7 @@ class AgenticChunker:
     # - title: A custom title for the chunk, to be derived in another function via an API call.
     # - returns a list of Document objects with the metadata added.
 
-    def chunk_documents(self, documents: List[Document]) -> List[Document]:
+    def chunk_documents(self, documents: List[Document], chunk_overlap: int = 0) -> List[Document]:
         """
         Chunk a list of Document objects into smaller pieces.
         
@@ -52,23 +53,31 @@ class AgenticChunker:
         Returns:
             A list of Document objects with chunked content and metadata.
         """
+
+        text_splitter = SentenceTransformersTokenTextSplitter(
+        chunk_overlap=chunk_overlap,
+        model_name="all-MiniLM-L6-v2"
+    )
+        tokens = text_splitter.split_documents(documents)
+
         chunked_docs = []
-        for doc in documents:
-            chunks = self.splitter.split_text(doc.page_content)
-            for i, chunk in enumerate(chunks):
-                chunk_id = str(uuid.uuid4())[:self.id_length_lim]  # Generate a short unique ID for the chunk
-                summary = self.generate_summary(chunk)
-                chunked_docs.append(
-                    Document(
-                        page_content=chunk,
-                        metadata={
-                            "chunk_id": chunk_id,
-                            "chunk/proposition": chunk,
-                            "summary": summary,
-                            **doc.metadata
-                        }
-                    )
-                )
+
+        for i, token in enumerate(tokens):
+            # Ensure each token has a unique ID and metadata
+            chunk_id = str(uuid.uuid4())[:self.id_length_lim] # Generate a short unique ID for the chunk
+            summary = self.generate_summary(token.page_content)  # Generate a summary for the chunk
+            # Create a Document object with the chunked content and metadata
+            chunked_docs.append([Document(
+                page_content=token.page_content,
+                metadata={
+                    "source": token.metadata.get("source", "unknown"),
+                    "chunk_index": i,
+                    "chunk_id": chunk_id,
+                    "chunk/proposition": token.page_content,
+                    "summary": summary
+                }
+            )])
+
         return chunked_docs
     
     # Need a function that generates a summary of the chunk passed into it, using the OpenAI API.
