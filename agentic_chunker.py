@@ -67,7 +67,7 @@ class AgenticChunker:
             chunk_id = str(uuid.uuid4())[:self.id_length_lim] # Generate a short unique ID for the chunk
             summary = self.generate_summary(token.page_content)  # Generate a summary for the chunk
             # Create a Document object with the chunked content and metadata
-            chunked_docs.append([Document(
+            chunked_docs.append(Document(
                 page_content=token.page_content,
                 metadata={
                     "source": token.metadata.get("source", "unknown"),
@@ -76,7 +76,7 @@ class AgenticChunker:
                     "chunk/proposition": token.page_content,
                     "summary": summary
                 }
-            )])
+            ))
 
         return chunked_docs
     
@@ -99,18 +99,20 @@ class AgenticChunker:
             Your task is to read the content of each chunk and generate a concise summary that captures the main points.
             The summary should be informative and relevant to the content of the chunk.
 
-            Example:
-            Chunk: "The financial report for Arsenal FC shows a significant increase in revenue, driven by successful merchandise sales and matchday income."
-            Summary: "Arsenal FC's financial report highlights a revenue increase due to merchandise and matchday income."
+            Chunk: The club reported a record increase in ticket sales and hospitality revenue, attributed to a strong home fixture calendar.
+            Summary: Ticket and hospitality revenue rose due to a strong home match calendar.
+
 
             Another example:
-            Chunk: "The new stadium development plans for Arsenal FC have been approved, promising to enhance the matchday experience for fans."
-            Summary: "Arsenal FC's new stadium development plans approved to improve matchday experience."
+            Chunk: The company’s net income fell 8% due to increased operational expenses and foreign exchange losses.
+            Summary:
+            Net income declined 8% due to higher operational costs and FX losses.
+
 
             Only respond with the chunk summary, nothing else.
              """
              ),
-            ("user", "Chunk's propositions:\n{proposition}\n\nCurrent chunk summary:\n{current_summary}")
+            ("user", "Chunk:\n{chunk}")
         ])
 
         chain = PROMPT | self.llm
@@ -123,7 +125,7 @@ class AgenticChunker:
         return summary
     
     # Need a function that generates embeddings for each chunk summary, which will be used for clustering.
-    def generate_embeddings(self, chunks: List[Document]) -> np.ndarray:
+    def generate_summary_embeddings(self, chunks: List[Document]) -> np.ndarray:
         """
         Generate embeddings for the summaries of the provided chunks using a pre-trained model.
         Args:
@@ -152,7 +154,7 @@ class AgenticChunker:
         Returns:
             A list of clusters, where each cluster is a list of Document objects.
         """
-        embeddings = self.generate_embeddings(chunks)
+        embeddings = self.generate_summary_embeddings(chunks)
 
         if embeddings.shape[0] == 0:
             return []
@@ -170,7 +172,30 @@ class AgenticChunker:
 
         return list(clusters.values())
     
+    # Need a function that takes the clustered chunks, and generates a new set of embeddings for these clusters, to be stored in a vector store in rag.py
+    def generate_cluster_embeddings(self, clusters: List[List[Document]]) -> np.ndarray:
+        """
+        Generate embeddings for the clustered chunks.
+        
+        Args:
+            clusters: A list of clusters, where each cluster is a list of Document objects.
+
+        Returns:
+            A numpy array of embeddings for the clusters.
+        """
+        if not clusters:
+            return np.empty((0, 0))
+
+        # Flatten the clusters to get all summaries
+        summaries = [chunk.metadata.get("summary", "") for cluster in clusters for chunk in cluster]
+
+        # Generate embeddings for the summaries
+        embeddings = self.model.encode(summaries, convert_to_tensor=False)
+
+        return np.array(embeddings)
+    
     # Need a function that projects the clustered chunks into a visualization space using UMAP
+    @staticmethod
     def visualize_clusters_with_umap(embeddings: np.ndarray, labels: List[int], chunks: List[Document]):
         """
         Visualize clustered embeddings in 2D space using UMAP.
