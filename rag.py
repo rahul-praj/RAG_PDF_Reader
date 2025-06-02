@@ -1,3 +1,4 @@
+from typing import List
 from langchain_community.document_loaders import UnstructuredPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_text_splitters import SentenceTransformersTokenTextSplitter
@@ -37,41 +38,28 @@ def load_pdf(file_path: str) -> list[Document]:
 doc = load_pdf("data/arsenal_financial_report.pdf")
 # print(len(doc))  # Display the number of documents loaded
 
-def chunk_documents(documents: list[Document], chunk_overlap: int = 0) -> list[Document]:
-    """Chunk documents into smaller pieces."""
-    text_splitter = SentenceTransformersTokenTextSplitter(
-        chunk_overlap=chunk_overlap,
-        model_name="all-MiniLM-L6-v2"
-    )
-    tokens = text_splitter.split_documents(documents)
+def create_vector_store(self, chunks: List[Document], collection_name: str = "chunked_documents") -> chromadb.Client:
+    """
+    Create a vector store from the clustered chunks.
+    
+    Args:
+        chunks: A list of Document objects with embeddings.
+        collection_name: The name of the collection in the vector store.
 
-    return [
-        Document(
-            page_content=token.page_content,
-            metadata={
-                "source": token.metadata.get("source", "unknown"),
-                "chunk_index": i
-            }
-        ) for i, token in enumerate(tokens)
-    ]
-
-chunks = chunk_documents(doc, chunk_overlap=0)
-print(len(chunks))  # Display the number of chunks created
-print(chunks[455].page_content)  # Display the content of the first chunk
-
-def create_vector_store(chunks: list[Document], collection_name: str = "arsenal_financial_report") -> chromadb.Client:
-    """Create a vector store from the document chunks."""
-    embeddings = OllamaEmbeddings(model="llama2")
+    Returns:
+        A ChromaDB client with the created collection.
+    """
     client = chromadb.Client()
     collection = client.create_collection(name=collection_name)
 
     for chunk in chunks:
-        collection.add(
-            documents=[chunk.page_content],
-            metadatas=[chunk.metadata],
-            ids=[str(chunk.metadata.get("chunk_index", "unknown"))],
-            embeddings=[embeddings.embed_documents([chunk.page_content])[0]]
-        )
+        if "embedding" in chunk.metadata:
+            collection.add(
+                ids=[chunk.metadata["chunk_id"]],
+                documents=[chunk.page_content],
+                metadatas=[chunk.metadata],
+                embeddings=[chunk.metadata["embedding"]]
+            )
 
     return client
 
