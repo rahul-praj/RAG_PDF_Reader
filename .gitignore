@@ -1,0 +1,18 @@
+# Ignore Python cache and virtual environment files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# Ignore environment variables
+.env
+
+# Ignore data folder (all contents)
+data/
+
+# Ignore virtual environment folders (if any)
+venv/
+env/
+
+# Ignore Mac system files
+.DS_Store
