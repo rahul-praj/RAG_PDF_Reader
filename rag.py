@@ -33,7 +33,18 @@ def load_pdf(file_path: str) -> list[Document]:
     if not elements:
         raise ValueError(f"No content found in the PDF file: {file_path}")
 
-    return [Document(page_content=doc.text, metadata={"source": file_path}) for doc in elements]
+    docs = []
+    for el in elements:
+        doc = Document(
+            page_content=el.text,
+            metadata={
+                "source": file_path,
+                "type": el.metadata.category or el.category or "Unknown"
+            }
+        )
+        docs.append(doc)
+
+    return docs
 
 doc = load_pdf("data/arsenal_financial_report.pdf")
 # print(len(doc))  # Display the number of documents loaded

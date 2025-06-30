@@ -4,10 +4,10 @@ from langchain_text_splitters import SentenceTransformersTokenTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from langchain.chat_models import ChatOpenAI
+import asyncio
 import uuid
 from dotenv import load_dotenv
 import os
-from sklearn.pipeline import Pipeline
 import hdbscan
 from sentence_transformers import SentenceTransformer
 from umap import UMAP
@@ -17,6 +17,31 @@ import matplotlib.pyplot as plt
 load_dotenv()
 
 class AgenticChunker:
+
+    PROMPT = ChatPromptTemplate.from_messages([
+
+        ("system",
+            """
+        You are a helpful assistant that summarizes chunks of text from a specific document.
+        Your task is to read the content of each chunk and generate a concise summary that captures the main points.
+        The summary should be informative and relevant to the content of the chunk.
+
+        Chunk: The club reported a record increase in ticket sales and hospitality revenue, attributed to a strong home fixture calendar.
+        Summary: Ticket and hospitality revenue rose due to a strong home match calendar.
+
+
+        Another example:
+        Chunk: The company’s net income fell 8% due to increased operational expenses and foreign exchange losses.
+        Summary:
+        Net income declined 8% due to higher operational costs and FX losses.
+
+
+        Only respond with the chunk summary, nothing else.
+            """
+            ),
+        ("user", "Chunk:\n{chunk}")
+        ])
+
     def __init__(self, openai_api_key: Union[str, None] = None, model_name: str = "all-mpnet-base-v2"):
         """Initialize the AgenticChunker with an OpenAI API key.
         Args:
@@ -32,9 +57,24 @@ class AgenticChunker:
             raise ValueError("API key is not provided and not found in environment variables")
 
         self.llm = ChatOpenAI(model='gpt-4-1106-preview', openai_api_key=openai_api_key, temperature=0)
-        # Need to set up the OpenAI API client here if you want to use it for generating summaries.
 
         self.model = SentenceTransformer(model_name)
+
+    # Need a function that applies the other functions to ultimately generate a final set of embeddings for the chunk summaries
+    async def get_embeddings(self, documents: List[Document], chunk_overlap: int = 0) -> List[Document]:
+        """
+        Process a list of Document objects by chunking, summarizing, and clustering them.
+        
+        Args:
+            documents: A list of Document objects to be processed.
+            chunk_overlap: The number of overlapping tokens between chunks.
+
+        Returns:
+            A NumPy array of embeddings for the clustered summaries.
+        """
+        chunked_docs = await self.chunk_documents(documents, chunk_overlap)
+        clusters = self.cluster_chunks(chunked_docs)
+        return self.generate_embeddings([doc for cluster in clusters for doc in cluster])
 
     # Need a function that loops through each chunk and adds the following metadata:
     # - chunk_id: A unique identifier for the chunk, e.g., "source_0", "source_1", etc.
@@ -43,30 +83,38 @@ class AgenticChunker:
     # - title: A custom title for the chunk, to be derived in another function via an API call.
     # - returns a list of Document objects with the metadata added.
 
-    def chunk_documents(self, documents: List[Document], chunk_overlap: int = 0) -> List[Document]:
+    async def chunk_documents(self, documents: List[Document], chunk_overlap: int = 0) -> List[Document]:
         """
-        Chunk a list of Document objects into smaller pieces.
-        
+        Chunk non-table documents into smaller pieces and generate summaries.
+        Preserve table documents as-is and skip summarization.
+
         Args:
-            documents: A list of Document objects to be chunked.
+            documents: List of Document objects with metadata from Unstructured.
+            chunk_overlap: Number of overlapping tokens between chunks.
 
         Returns:
-            A list of Document objects with chunked content and metadata.
+            List of Document objects with chunked content and metadata (including summaries).
         """
 
+        # Separate table and non-table documents
+        table_docs = [doc for doc in documents if "table" in doc.metadata.get("type", "").lower()]
+        text_docs = [doc for doc in documents if "table" not in doc.metadata.get("type", "").lower()]
+
+        # Apply token splitter only to non-table text documents
         text_splitter = SentenceTransformersTokenTextSplitter(
-        chunk_overlap=chunk_overlap,
-        model_name="all-MiniLM-L6-v2"
-    )
-        tokens = text_splitter.split_documents(documents)
+            chunk_overlap=chunk_overlap,
+            model_name="all-MiniLM-L6-v2"
+        )
+        tokens = text_splitter.split_documents(text_docs)
 
         chunked_docs = []
 
-        for i, token in enumerate(tokens):
-            # Ensure each token has a unique ID and metadata
-            chunk_id = str(uuid.uuid4())[:self.id_length_lim] # Generate a short unique ID for the chunk
-            summary = self.generate_summary(token.page_content)  # Generate a summary for the chunk
-            # Create a Document object with the chunked content and metadata
+        # Process non-table chunks with LLM summarization
+        summaries = await asyncio.gather(*[
+            self.generate_summary(token.page_content) for token in tokens
+        ])
+
+        for i, (token, summary) in enumerate(zip(tokens, summaries)):
             chunked_docs.append(Document(
                 page_content=token.page_content,
                 metadata={
@@ -74,14 +122,30 @@ class AgenticChunker:
                     "chunk_index": i,
                     "chunk_id": chunk_id,
                     "chunk/proposition": token.page_content,
-                    "summary": summary
+                    "summary": summary,
+                    "type": token.metadata.get("type", "text")
+                }
+            ))
+
+        # Process table chunks — no splitting or summarization
+        for i, table_doc in enumerate(table_docs):
+            chunk_id = str(uuid.uuid4())[:self.id_length_lim]
+            chunked_docs.append(Document(
+                page_content=table_doc.page_content,
+                metadata={
+                    "source": table_doc.metadata.get("source", "unknown"),
+                    "chunk_index": len(chunked_docs) + i,
+                    "chunk_id": chunk_id,
+                    "chunk/proposition": table_doc.page_content,
+                    "summary": table_doc.page_content,  # Table content preserved
+                    "type": table_doc.metadata.get("type", "table")
                 }
             ))
 
         return chunked_docs
     
     # Need a function that generates a summary of the chunk passed into it, using the OpenAI API.
-    def generate_summary(self, chunk: str) -> str:
+    async def generate_summary(self, chunk: str) -> str:
         """
         Generate a summary for a given chunk of text.
         
@@ -92,56 +156,23 @@ class AgenticChunker:
             A summary of the chunk.
         """
 
-        PROMPT = ChatPromptTemplate.from_messages([
-            ("system",
-             """
-            You are a helpful assistant that summarizes chunks of text from a specific document.
-            Your task is to read the content of each chunk and generate a concise summary that captures the main points.
-            The summary should be informative and relevant to the content of the chunk.
+        chain = self.PROMPT | self.llm
 
-            Chunk: The club reported a record increase in ticket sales and hospitality revenue, attributed to a strong home fixture calendar.
-            Summary: Ticket and hospitality revenue rose due to a strong home match calendar.
-
-
-            Another example:
-            Chunk: The company’s net income fell 8% due to increased operational expenses and foreign exchange losses.
-            Summary:
-            Net income declined 8% due to higher operational costs and FX losses.
-
-
-            Only respond with the chunk summary, nothing else.
-             """
-             ),
-            ("user", "Chunk:\n{chunk}")
-        ])
-
-        chain = PROMPT | self.llm
-
-        summary = chain.invoke({
-            "proposition": chunk,
-            "current_summary": ""
-        }).content
-
-        return summary
+        return (await chain.ainvoke({"chunk": chunk})).content
     
-    # Need a function that generates embeddings for each chunk summary, which will be used for clustering.
-    def generate_summary_embeddings(self, chunks: List[Document]) -> np.ndarray:
-        """
-        Generate embeddings for the summaries of the provided chunks using a pre-trained model.
-        Args:
-            chunks: A list of Document objects, each containing a summary in its metadata.
-        Returns:
-            A numpy array of embeddings for the summaries.
-        """
-        if not chunks:
-            return np.empty((0, 0))
+    def generate_embeddings(self, docs: List[Document]) -> List[Document]:
+        if not docs:
+            return []
 
-        summaries = [chunk.metadata.get("summary", "") for chunk in chunks]
-
-        # Generate embeddings for the summaries
+        summaries = [doc.metadata.get("summary", "") for doc in docs]
         embeddings = self.model.encode(summaries, convert_to_tensor=False)
 
-        return np.array(embeddings)
+        # Add embeddings to each Document's metadata
+        for doc, embedding in zip(docs, embeddings):
+            doc.metadata["embedding"] = embedding.tolist()
+
+        return docs
+
     
     # Need a function that creates a clustering algorithm that uses the embeddings of the chunk summaries to group similar chunks together.
     def cluster_chunks(self, chunks: List[Document]) -> List[List[Document]]:
@@ -154,9 +185,9 @@ class AgenticChunker:
         Returns:
             A list of clusters, where each cluster is a list of Document objects.
         """
-        embeddings = self.generate_summary_embeddings(chunks)
+        embeddings = self.generate_embeddings(chunks)
 
-        if embeddings.shape[0] == 0:
+        if not chunks:
             return []
 
         clustering_model = hdbscan.HDBSCAN(min_cluster_size=2, metric='euclidean')
@@ -165,34 +196,12 @@ class AgenticChunker:
         clusters = {}
 
         for label, chunk in zip(labels, chunks):
-            # Optionally skip noise points (label = -1)
+            chunk.metadata["cluster"] = int(label)
             if label == -1:
                 continue
             clusters.setdefault(label, []).append(chunk)
 
         return list(clusters.values())
-    
-    # Need a function that takes the clustered chunks, and generates a new set of embeddings for these clusters, to be stored in a vector store in rag.py
-    def generate_cluster_embeddings(self, clusters: List[List[Document]]) -> np.ndarray:
-        """
-        Generate embeddings for the clustered chunks.
-        
-        Args:
-            clusters: A list of clusters, where each cluster is a list of Document objects.
-
-        Returns:
-            A numpy array of embeddings for the clusters.
-        """
-        if not clusters:
-            return np.empty((0, 0))
-
-        # Flatten the clusters to get all summaries
-        summaries = [chunk.metadata.get("summary", "") for cluster in clusters for chunk in cluster]
-
-        # Generate embeddings for the summaries
-        embeddings = self.model.encode(summaries, convert_to_tensor=False)
-
-        return np.array(embeddings)
     
     # Need a function that projects the clustered chunks into a visualization space using UMAP
     @staticmethod
@@ -230,7 +239,7 @@ class AgenticChunker:
         plt.ylabel("UMAP 2")
         plt.grid(True)
 
-        # Optional: annotate noise
+        # annotate noise
         if -1 in labels:
             noise_indices = [i for i, l in enumerate(labels) if l == -1]
             plt.scatter(
@@ -239,7 +248,6 @@ class AgenticChunker:
                 c='lightgray', label='Noise', s=60, edgecolors='k'
             )
 
-        # Optional legend
         handles = [plt.Line2D([0], [0], marker='o', color='w', label=f'Cluster {label}',
                             markerfacecolor=palette(unique_labels.index(label)), markersize=8)
                 for label in unique_labels if label != -1]
@@ -250,4 +258,5 @@ class AgenticChunker:
 
         plt.tight_layout()
         plt.show()
+
 
