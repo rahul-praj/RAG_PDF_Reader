@@ -70,19 +70,14 @@ class AgenticChunker:
             chunk_overlap: The number of overlapping tokens between chunks.
 
         Returns:
-            A NumPy array of embeddings for the clustered summaries.
+            A list of Document objects with embeddings generated for each chunk summary.
         """
         chunked_docs = await self.chunk_documents(documents, chunk_overlap)
         clusters = self.cluster_chunks(chunked_docs)
-        return self.generate_embeddings([doc for cluster in clusters for doc in cluster])
+        clustered_docs = [doc for cluster in clusters for doc in cluster]
+        return clustered_docs
 
-    # Need a function that loops through each chunk and adds the following metadata:
-    # - chunk_id: A unique identifier for the chunk, e.g., "source_0", "source_1", etc.
-    # - chunk/proposition: The chunk of text itself.
-    # - summary: A summary heading for the chunk, to be derived in another function via an API call to OpenAI.
-    # - title: A custom title for the chunk, to be derived in another function via an API call.
-    # - returns a list of Document objects with the metadata added.
-
+    # Need a function that loops through each chunk and adds metadata to each Document object, including chunk ID, index, and summary.
     async def chunk_documents(self, documents: List[Document], chunk_overlap: int = 0) -> List[Document]:
         """
         Chunk non-table documents into smaller pieces and generate summaries.
@@ -115,6 +110,7 @@ class AgenticChunker:
         ])
 
         for i, (token, summary) in enumerate(zip(tokens, summaries)):
+            chunk_id = str(uuid.uuid4())[:self.id_length_lim]
             chunked_docs.append(Document(
                 page_content=token.page_content,
                 metadata={
@@ -185,9 +181,10 @@ class AgenticChunker:
         Returns:
             A list of clusters, where each cluster is a list of Document objects.
         """
-        embeddings = self.generate_embeddings(chunks)
+        enriched_docs = self.generate_embeddings(chunks)
+        embeddings = np.array([doc.metadata["embedding"] for doc in enriched_docs])
 
-        if not chunks:
+        if len(enriched_docs) == 0:
             return []
 
         clustering_model = hdbscan.HDBSCAN(min_cluster_size=2, metric='euclidean')
@@ -195,13 +192,39 @@ class AgenticChunker:
 
         clusters = {}
 
-        for label, chunk in zip(labels, chunks):
-            chunk.metadata["cluster"] = int(label)
+        for label, doc in zip(labels, enriched_docs):
+            doc.metadata["cluster"] = int(label)
             if label == -1:
                 continue
-            clusters.setdefault(label, []).append(chunk)
+            clusters.setdefault(label, []).append(doc)
 
         return list(clusters.values())
+    
+    def generate_cluster_embeddings(self, clusters: List[List[Document]]) -> List[Document]:
+        """
+        Generate representative embeddings for each cluster by averaging member embeddings.
+        """
+        cluster_docs = []
+
+        for cluster in clusters:
+            cluster_id = cluster[0].metadata["cluster"]
+            source = cluster[0].metadata.get("source", "unknown")
+            combined_summary = " ".join([doc.metadata.get("summary", "") for doc in cluster])
+            embeddings = np.array([doc.metadata["embedding"] for doc in cluster])
+            avg_embedding = np.mean(embeddings, axis=0)
+
+            cluster_doc = Document(
+                page_content=combined_summary,
+                metadata={
+                    "cluster_id": int(cluster_id),
+                    "source": source,
+                    "embedding": avg_embedding.tolist(),
+                    "num_chunks": len(cluster)
+                }
+            )
+            cluster_docs.append(cluster_doc)
+
+        return cluster_docs
     
     # Need a function that projects the clustered chunks into a visualization space using UMAP
     @staticmethod
@@ -258,5 +281,24 @@ class AgenticChunker:
 
         plt.tight_layout()
         plt.show()
+
+if __name__ == "__main__":
+    # Example usage
+    chunker = AgenticChunker()
+
+    # Sample documents
+    docs = [
+        Document(page_content="Artificial intelligence is a branch of computer science that aims to create machines that can perform tasks that typically require human intelligence.",
+                 metadata={"source": "doc1", "type": "text"}),
+        Document(page_content="The quick brown fox jumps over the lazy dog.",
+                 metadata={"source": "doc2", "type": "text"}),
+        Document(page_content="A table with data about sales.",
+                 metadata={"source": "doc3", "type": "table"})
+    ]
+
+    processed_docs = asyncio.run(chunker.get_embeddings(docs, chunk_overlap=10))
+    embeddings = np.array([doc.metadata["embedding"] for doc in processed_docs if "embedding" in doc.metadata])
+    labels = [doc.metadata.get("cluster", -1) for doc in processed_docs]
+    AgenticChunker.visualize_clusters_with_umap(embeddings, labels, processed_docs)
 
 
