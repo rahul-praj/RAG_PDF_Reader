@@ -1,17 +1,25 @@
 from typing import List, Union
 import numpy as np
+import random
+import os
+from dotenv import load_dotenv
+
 from langchain_text_splitters import SentenceTransformersTokenTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
-from langchain.chat_models import ChatOpenAI
-import asyncio
-import uuid
-from dotenv import load_dotenv
-import os
-import hdbscan
+from langchain_community.chat_models import ChatOpenAI
 from sentence_transformers import SentenceTransformer
+
+from unstructured.partition.pdf import partition_pdf
+import uuid
+
+import openai
+import asyncio
+
+import hdbscan
 from umap import UMAP
 import matplotlib.pyplot as plt
+
 
 # Load environment variables from .env file
 load_dotenv()
@@ -42,7 +50,7 @@ class AgenticChunker:
         ("user", "Chunk:\n{chunk}")
         ])
 
-    def __init__(self, openai_api_key: Union[str, None] = None, model_name: str = "all-mpnet-base-v2"):
+    def __init__(self, openai_api_key: Union[str, None] = None, model_name: str = "all-MiniLM-L6-v2"):
         """Initialize the AgenticChunker with an OpenAI API key.
         Args:
             openai_api_key: Optional; if not provided, it will look for the OPENAI_API_KEY environment variable.
@@ -56,7 +64,7 @@ class AgenticChunker:
         if openai_api_key is None:
             raise ValueError("API key is not provided and not found in environment variables")
 
-        self.llm = ChatOpenAI(model='gpt-4-1106-preview', openai_api_key=openai_api_key, temperature=0)
+        self.llm = ChatOpenAI(model="gpt-4.1-mini", openai_api_key=openai_api_key, temperature=0)
 
         self.model = SentenceTransformer(model_name)
 
@@ -104,9 +112,27 @@ class AgenticChunker:
 
         chunked_docs = []
 
+        # Concurrency and backoff
+
+        semaphore = asyncio.Semaphore(3)  # limit to 3 concurrent requests
+
+        async def generate_summary_with_backoff(token_content: str, retries=5):
+            for attempt in range(retries):
+                try:
+                    async with semaphore:
+                        return await self.generate_summary(token_content)
+                except openai.RateLimitError as e:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    print(f"Rate limit hit. Retrying in {wait_time:.2f} seconds...")
+                    await asyncio.sleep(wait_time)
+                except Exception as e:
+                    print(f"Error generating summary: {e}")
+                    raise e
+            raise Exception("Max retries exceeded for summarisation")
+
         # Process non-table chunks with LLM summarization
         summaries = await asyncio.gather(*[
-            self.generate_summary(token.page_content) for token in tokens
+            generate_summary_with_backoff(token.page_content) for token in tokens
         ])
 
         for i, (token, summary) in enumerate(zip(tokens, summaries)):
@@ -287,14 +313,25 @@ if __name__ == "__main__":
     chunker = AgenticChunker()
 
     # Sample documents
-    docs = [
-        Document(page_content="Artificial intelligence is a branch of computer science that aims to create machines that can perform tasks that typically require human intelligence.",
-                 metadata={"source": "doc1", "type": "text"}),
-        Document(page_content="The quick brown fox jumps over the lazy dog.",
-                 metadata={"source": "doc2", "type": "text"}),
-        Document(page_content="A table with data about sales.",
-                 metadata={"source": "doc3", "type": "table"})
-    ]
+    """Load a PDF file and return a list of Document objects."""
+    elements = partition_pdf(
+        filename="data/arsenal_financial_report.pdf",
+        strategy="hi_res",
+        hi_res_model_name='yolox',
+        infer_table_structure=True)
+
+    docs = []
+    for el in elements:
+        doc = Document(
+            page_content=el.text,
+            metadata={
+                "source": "data/arsenal_financial_report.pdf",
+                "type": el.category or "Unknown"
+            }
+        )
+        docs.append(doc)
+
+    print(f"Loaded {len(docs)} documents from the PDF.")
 
     processed_docs = asyncio.run(chunker.get_embeddings(docs, chunk_overlap=10))
     embeddings = np.array([doc.metadata["embedding"] for doc in processed_docs if "embedding" in doc.metadata])
