@@ -50,7 +50,7 @@ class AgenticChunker:
         ("user", "Chunk:\n{chunk}")
         ])
 
-    def __init__(self, openai_api_key: Union[str, None] = None, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, openai_api_key: Union[str, None] = None, model_name: str = "all-mpnet-base-v2"):
         """Initialize the AgenticChunker with an OpenAI API key.
         Args:
             openai_api_key: Optional; if not provided, it will look for the OPENAI_API_KEY environment variable.
@@ -106,7 +106,7 @@ class AgenticChunker:
         # Apply token splitter only to non-table text documents
         text_splitter = SentenceTransformersTokenTextSplitter(
             chunk_overlap=chunk_overlap,
-            model_name="all-MiniLM-L6-v2"
+            model_name="all-mpnet-base-v2"
         )
         tokens = text_splitter.split_documents(text_docs)
 
