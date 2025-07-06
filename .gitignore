@@ -16,3 +16,6 @@ env/
 
 # Ignore Mac system files
 .DS_Store
+
+# Ignore vector store files
+cluster_vectorstore/
