@@ -19,3 +19,6 @@ env/
 
 # Ignore vector store files
 cluster_vectorstore/
+
+#Ignore cache files
+backend/app/summary_cache.json
