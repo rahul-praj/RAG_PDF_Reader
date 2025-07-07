@@ -13,12 +13,10 @@ import chromadb
 from langchain.vectorstores import Chroma
 from langchain.embeddings import HuggingFaceEmbeddings
 
-from agentic_chunker import AgenticChunker
+from backend.app.services.agentic_chunker import AgenticChunker
 
 warnings.filterwarnings("ignore")
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-
-from IPython.display import display, Markdown
 
 def load_pdf(file_path: str) -> list[Document]:
     """Load a PDF file and return a list of Document objects."""
