@@ -2,7 +2,10 @@ from typing import List, Union
 import numpy as np
 import random
 import os
+import json
+import hashlib
 from dotenv import load_dotenv
+
 
 from langchain_text_splitters import SentenceTransformersTokenTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
@@ -17,12 +20,16 @@ import openai
 import asyncio
 
 import hdbscan
+from sklearn.decomposition import PCA
 from umap import UMAP
 import matplotlib.pyplot as plt
 
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Define sentence transformer model for chunk summarization
+sentence_transformer_model = SentenceTransformer("all-mpnet-base-v2")
 
 class AgenticChunker:
 
@@ -34,6 +41,7 @@ class AgenticChunker:
         Your task is to read the content of each chunk and generate a concise summary that captures the main points.
         The summary should be informative and relevant to the content of the chunk.
 
+        Example:
         Chunk: The club reported a record increase in ticket sales and hospitality revenue, attributed to a strong home fixture calendar.
         Summary: Ticket and hospitality revenue rose due to a strong home match calendar.
 
@@ -64,9 +72,9 @@ class AgenticChunker:
         if openai_api_key is None:
             raise ValueError("API key is not provided and not found in environment variables")
 
-        self.llm = ChatOpenAI(model="gpt-4.1-mini", openai_api_key=openai_api_key, temperature=0)
+        self.llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=openai_api_key, temperature=0)
 
-        self.model = SentenceTransformer(model_name)
+        self.model = sentence_transformer_model
 
     # Need a function that applies the other functions to ultimately generate a final set of embeddings for the chunk summaries
     async def get_embeddings(self, documents: List[Document], chunk_overlap: int = 0) -> List[Document]:
@@ -84,9 +92,79 @@ class AgenticChunker:
         clusters = self.cluster_chunks(chunked_docs)
         clustered_docs = [doc for cluster in clusters for doc in cluster]
         return clustered_docs
+    
+    def hash_text(self, text: str) -> str:
+        return hashlib.sha256(text.encode()).hexdigest()
+    
+    async def generate_summaries_batch_with_cache(self, tokens: List[Document], batch_size: int = 5, cache_file="summary_cache.json") -> List[str]:
+
+        """
+        Batch summarise tokens with caching.
+        """
+        summaries = []
+
+        # Load cache
+        if os.path.exists(cache_file):
+            with open(cache_file, "r") as f:
+                cache = json.load(f)
+        else:
+            cache = {}
+
+        # Break into batches
+        batches = [tokens[i:i+batch_size] for i in range(0, len(tokens), batch_size)]
+
+        for batch in batches:
+            # Check cache for each token
+            uncached_indices = []
+            uncached_tokens = []
+            batch_summaries = [None] * len(batch)
+
+            for idx, token in enumerate(batch):
+                h = self.hash_text(token.page_content)
+                if h in cache:
+                    batch_summaries[idx] = cache[h]
+                else:
+                    uncached_indices.append(idx)
+                    uncached_tokens.append(token)
+
+            # If any tokens are uncached, summarise them
+            if uncached_tokens:
+                prompt_text = "\n\n".join([f"Chunk {i+1}:\n{token.page_content}" for i, token in enumerate(uncached_tokens)])
+                prompt = f"""
+                Summarise each chunk concisely. Output only the summaries in order, formatted as:
+
+                Summary 1: ...
+                Summary 2: ...
+                ...
+
+                Chunks:
+                {prompt_text}
+                """
+
+                chain = ChatPromptTemplate.from_messages([
+                    ("system", "You are a helpful assistant summarising text chunks."),
+                    ("user", prompt)
+                ]) | self.llm
+
+                output = await chain.ainvoke({})
+
+                parsed_summaries = [line.split(": ", 1)[1] for line in output.content.strip().split("\n") if line.startswith("Summary")]
+
+                # Update batch_summaries and cache
+                for idx, summary, token in zip(uncached_indices, parsed_summaries, uncached_tokens):
+                    batch_summaries[idx] = summary
+                    cache[self.hash_text(token.page_content)] = summary
+
+            summaries.extend(batch_summaries)
+
+        # Save updated cache
+        with open(cache_file, "w") as f:
+            json.dump(cache, f)
+
+        return summaries
 
     # Need a function that loops through each chunk and adds metadata to each Document object, including chunk ID, index, and summary.
-    async def chunk_documents(self, documents: List[Document], chunk_overlap: int = 0) -> List[Document]:
+    async def chunk_documents(self, documents: List[Document], chunk_size: int = 400, chunk_overlap: int = 10) -> List[Document]:
         """
         Chunk non-table documents into smaller pieces and generate summaries.
         Preserve table documents as-is and skip summarization.
@@ -106,6 +184,7 @@ class AgenticChunker:
         # Apply token splitter only to non-table text documents
         text_splitter = SentenceTransformersTokenTextSplitter(
             chunk_overlap=chunk_overlap,
+            chunk_size=chunk_size,
             model_name="all-mpnet-base-v2"
         )
         tokens = text_splitter.split_documents(text_docs)
@@ -116,24 +195,8 @@ class AgenticChunker:
 
         semaphore = asyncio.Semaphore(3)  # limit to 3 concurrent requests
 
-        async def generate_summary_with_backoff(token_content: str, retries=5):
-            for attempt in range(retries):
-                try:
-                    async with semaphore:
-                        return await self.generate_summary(token_content)
-                except openai.RateLimitError as e:
-                    wait_time = (2 ** attempt) + random.uniform(0, 1)
-                    print(f"Rate limit hit. Retrying in {wait_time:.2f} seconds...")
-                    await asyncio.sleep(wait_time)
-                except Exception as e:
-                    print(f"Error generating summary: {e}")
-                    raise e
-            raise Exception("Max retries exceeded for summarisation")
-
         # Process non-table chunks with LLM summarization
-        summaries = await asyncio.gather(*[
-            generate_summary_with_backoff(token.page_content) for token in tokens
-        ])
+        summaries = await self.generate_summaries_batch_with_cache(tokens, batch_size=5)
 
         for i, (token, summary) in enumerate(zip(tokens, summaries)):
             chunk_id = str(uuid.uuid4())[:self.id_length_lim]
@@ -166,22 +229,6 @@ class AgenticChunker:
 
         return chunked_docs
     
-    # Need a function that generates a summary of the chunk passed into it, using the OpenAI API.
-    async def generate_summary(self, chunk: str) -> str:
-        """
-        Generate a summary for a given chunk of text.
-        
-        Args:
-            chunk: The text chunk to summarize.
-
-        Returns:
-            A summary of the chunk.
-        """
-
-        chain = self.PROMPT | self.llm
-
-        return (await chain.ainvoke({"chunk": chunk})).content
-    
     def generate_embeddings(self, docs: List[Document]) -> List[Document]:
         if not docs:
             return []
@@ -213,8 +260,12 @@ class AgenticChunker:
         if len(enriched_docs) == 0:
             return []
 
-        clustering_model = hdbscan.HDBSCAN(min_cluster_size=2, metric='euclidean')
-        labels = clustering_model.fit_predict(embeddings)
+        clustering_model = hdbscan.HDBSCAN(min_cluster_size=10, min_samples=5, metric='euclidean', core_dist_n_jobs=-1)
+
+        # Implement PCA to reduce dimensionality before clustering
+        pca = PCA(n_components=min(50, embeddings.shape[1]))
+        pca_embeddings = pca.fit_transform(embeddings)
+        labels = clustering_model.fit_predict(pca_embeddings)
 
         clusters = {}
 
